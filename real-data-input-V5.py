@@ -18,7 +18,7 @@ if 'model' not in st.session_state:
         'global_bounds': {}, 'expert_constraints': {},
         'current_inputs': {}, 
         'ver': 0,
-        'expert_reliability': 0.7, # 기본 신뢰성을 70%로 조정
+        'expert_reliability': 0.7, 
         'last_res_val': None,
         'last_opt_df': None
     })
@@ -39,7 +39,6 @@ with st.sidebar:
         
         df_i, df_v, df_r = load_data(u1), load_data(u2), load_data(u3)
         if df_i is not None and (df_v is not None or df_r is not None):
-            # 데이터 병합 및 학습
             df_comb = pd.concat([df for df in [df_v, df_r] if df is not None]).dropna(subset=[TARGET_VAR])
             vars_list = [c for c in df_comb.columns if c != TARGET_VAR]
             df_comb[TARGET_VAR] = np.where(df_comb[TARGET_VAR] >= DEFECT_THRESHOLD, 1, 0)
@@ -47,7 +46,6 @@ with st.sidebar:
             scaler = MinMaxScaler().fit(df_comb[vars_list])
             model = LogisticRegression().fit(scaler.transform(df_comb[vars_list]), df_comb[TARGET_VAR])
             
-            # UI 표시용 변수 (초기 조건 파일 기준)
             ui_vars = [c for c in df_i.columns if c != TARGET_VAR]
             
             st.session_state.update({
@@ -55,15 +53,11 @@ with st.sidebar:
                 'global_process_vars': vars_list, 'ui_display_vars': ui_vars
             })
             
-            # 💡 수정 포인트: 초기값을 기준으로 0% ~ 200% 범위 설정
             init_row = df_i.iloc[0].to_dict()
             for v in vars_list:
                 base_val = float(init_row.get(v, 0))
-                # 0~200% 범위 설정 (최소 0, 최대는 기준값의 2배)
-                # 만약 기준값이 0이라면 범위를 0~100으로 임시 설정
                 v_min = 0
                 v_max = int(base_val * 2) if base_val > 0 else 100
-                
                 if v_min == v_max: v_max = v_min + 1
                 
                 st.session_state['global_bounds'][v] = (v_min, v_max)
@@ -81,24 +75,21 @@ if st.session_state['model']:
 
     with t1:
         # A. 공정 조건 입력
-        st.header("A. 현재 공정 조건 입력 (범위: 기존값의 0% ~ 200%)")
+        st.header("A. 현재 공정 조건 입력 (범위: 0% ~ 200%)")
         cols = st.columns(3)
         for i, var in enumerate(st.session_state['ui_display_vars']):
             with cols[i % 3]:
-                # 저장된 0~200% 범위를 불러옴
                 b_min, b_max = st.session_state['global_bounds'].get(var, (0, 100))
                 st.session_state['current_inputs'][var] = st.slider(
                     f"{var}", 
-                    min_value=int(b_min), 
-                    max_value=int(b_max), 
+                    min_value=int(b_min), max_value=int(b_max), 
                     value=int(st.session_state['current_inputs'].get(var, b_min)), 
-                    step=1, 
-                    key=f"sl_{var}_{st.session_state['ver']}"
+                    step=1, key=f"sl_{var}_{st.session_state['ver']}"
                 )
 
         st.markdown("---")
         
-        # B. 전문가 노하우 및 신뢰성
+        # B. 전문가 노하우 및 신뢰성 (한 행에 2개씩 배치되도록 수정)
         st.header("B. 전문가 노하우 및 신뢰성")
         selected_expert_vars = st.multiselect(
             "전문가 관리 변수 선택", 
@@ -107,9 +98,12 @@ if st.session_state['model']:
         )
         
         if selected_expert_vars:
-            cols_b = st.columns(len(selected_expert_vars))
-            for i, v_name in enumerate(selected_expert_vars):
-                with cols_b[i]:
+            # 💡 수정된 로직: 2열 그리드 배치
+            for i in range(0, len(selected_expert_vars), 2):
+                row_cols = st.columns(2)
+                # 현재 행의 첫 번째 항목
+                with row_cols[0]:
+                    v_name = selected_expert_vars[i]
                     st.subheader(f"[{v_name}] 기준값")
                     st.session_state['expert_constraints'].setdefault(v_name, {'limit': st.session_state['current_inputs'].get(v_name, 0)})
                     st.session_state['expert_constraints'][v_name]['limit'] = st.number_input(
@@ -117,10 +111,28 @@ if st.session_state['model']:
                         value=int(st.session_state['expert_constraints'][v_name]['limit']), 
                         step=1, key=f"num_{v_name}"
                     )
+                
+                # 현재 행의 두 번째 항목 (존재할 경우)
+                if i + 1 < len(selected_expert_vars):
+                    with row_cols[1]:
+                        v_name = selected_expert_vars[i+1]
+                        st.subheader(f"[{v_name}] 기준값")
+                        st.session_state['expert_constraints'].setdefault(v_name, {'limit': st.session_state['current_inputs'].get(v_name, 0)})
+                        st.session_state['expert_constraints'][v_name]['limit'] = st.number_input(
+                            f"목표치 설정 ({v_name})", 
+                            value=int(st.session_state['expert_constraints'][v_name]['limit']), 
+                            step=1, key=f"num_{v_name}"
+                        )
         
         st.session_state['expert_reliability'] = st.slider("👨‍🏫 전문가 의견 반영 강도 (%)", 0, 100, int(st.session_state['expert_reliability']*100)) / 100.0
         
         if st.button("💾 전문가 설정 반영", use_container_width=True):
+            # 선택 해제된 변수는 제약 조건에서 삭제
+            current_expert_keys = list(st.session_state['expert_constraints'].keys())
+            for key in current_expert_keys:
+                if key not in selected_expert_vars:
+                    del st.session_state['expert_constraints'][key]
+            
             st.session_state['last_res_val'] = None
             st.session_state['last_opt_df'] = None
             st.rerun()
@@ -139,14 +151,15 @@ if st.session_state['model']:
             penalty = 0
             for v, c in st.session_state['expert_constraints'].items():
                 v_idx = list(all_v).index(v)
-                diff_ratio = abs(input_vals_list[v_idx] - c['limit']) / (c['limit'] + 1e-9)
+                # 분모 0 방지
+                base = c['limit'] if c['limit'] != 0 else 1.0
+                diff_ratio = abs(input_vals_list[v_idx] - c['limit']) / base
                 penalty += diff_ratio
             
             rel = st.session_state['expert_reliability']
             final_score = ai_prob + (penalty * rel)
             return min(1.0, final_score)
 
-        # [현재 진단]
         if c_btn1.button("🔍 현재 조건 진단하기", type="primary", use_container_width=True):
             all_v = st.session_state['global_process_vars']
             input_vals = [float(st.session_state['current_inputs'].get(v, 0)) for v in all_v]
@@ -154,7 +167,6 @@ if st.session_state['model']:
             st.session_state['last_opt_df'] = None
             st.rerun()
 
-        # [최적 공정 도출]
         if c_btn2.button("✨ 최적 공정 도출", use_container_width=True):
             all_v = st.session_state['global_process_vars']
             x0 = [float(st.session_state['current_inputs'].get(v, 0.0)) for v in all_v]
@@ -168,7 +180,6 @@ if st.session_state['model']:
                 st.session_state['last_opt_df'] = pd.DataFrame([{v: opt_dict.get(v) for v in st.session_state['ui_display_vars']}])
                 st.rerun()
 
-        # 📊 결과 출력
         if st.session_state['last_res_val'] is not None:
             st.markdown("---")
             val = st.session_state['last_res_val']
