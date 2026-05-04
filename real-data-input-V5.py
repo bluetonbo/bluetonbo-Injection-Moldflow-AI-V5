@@ -20,7 +20,8 @@ if 'model' not in st.session_state:
         'ver': 0,
         'expert_reliability': 0.7, 
         'last_res_val': None,
-        'last_opt_df': None
+        'last_opt_df': None,
+        'last_diag_val': None  # 현재 진단값 별도 저장
     })
 
 # =================================================================
@@ -89,7 +90,7 @@ if st.session_state['model']:
 
         st.markdown("---")
         
-        # B. 전문가 노하우 및 신뢰성 (한 행에 2개씩 배치되도록 수정)
+        # B. 전문가 노하우 및 신뢰성
         st.header("B. 전문가 노하우 및 신뢰성")
         selected_expert_vars = st.multiselect(
             "전문가 관리 변수 선택", 
@@ -98,10 +99,8 @@ if st.session_state['model']:
         )
         
         if selected_expert_vars:
-            # 💡 수정된 로직: 2열 그리드 배치
             for i in range(0, len(selected_expert_vars), 2):
                 row_cols = st.columns(2)
-                # 현재 행의 첫 번째 항목
                 with row_cols[0]:
                     v_name = selected_expert_vars[i]
                     st.subheader(f"[{v_name}] 기준값")
@@ -111,8 +110,6 @@ if st.session_state['model']:
                         value=int(st.session_state['expert_constraints'][v_name]['limit']), 
                         step=1, key=f"num_{v_name}"
                     )
-                
-                # 현재 행의 두 번째 항목 (존재할 경우)
                 if i + 1 < len(selected_expert_vars):
                     with row_cols[1]:
                         v_name = selected_expert_vars[i+1]
@@ -127,12 +124,10 @@ if st.session_state['model']:
         st.session_state['expert_reliability'] = st.slider("👨‍🏫 전문가 의견 반영 강도 (%)", 0, 100, int(st.session_state['expert_reliability']*100)) / 100.0
         
         if st.button("💾 전문가 설정 반영", use_container_width=True):
-            # 선택 해제된 변수는 제약 조건에서 삭제
             current_expert_keys = list(st.session_state['expert_constraints'].keys())
             for key in current_expert_keys:
                 if key not in selected_expert_vars:
                     del st.session_state['expert_constraints'][key]
-            
             st.session_state['last_res_val'] = None
             st.session_state['last_opt_df'] = None
             st.rerun()
@@ -146,50 +141,66 @@ if st.session_state['model']:
         def calculate_risk(input_vals_list):
             all_v = st.session_state['global_process_vars']
             df_input = pd.DataFrame([input_vals_list], columns=all_v)
+            # 확률값 추출
             ai_prob = st.session_state['model'].predict_proba(st.session_state['scaler'].transform(df_input))[0, 1]
             
             penalty = 0
             for v, c in st.session_state['expert_constraints'].items():
                 v_idx = list(all_v).index(v)
-                # 분모 0 방지
-                base = c['limit'] if c['limit'] != 0 else 1.0
+                base = float(c['limit']) if float(c['limit']) != 0 else 1.0
+                # 차이의 절대값 비율을 패널티로 사용
                 diff_ratio = abs(input_vals_list[v_idx] - c['limit']) / base
                 penalty += diff_ratio
             
             rel = st.session_state['expert_reliability']
-            final_score = ai_prob + (penalty * rel)
-            return min(1.0, final_score)
+            # 최종 점수 = AI 확률 + (패널티 * 신뢰도 가중치)
+            return float(ai_prob + (penalty * rel))
 
+        # [현재 진단]
         if c_btn1.button("🔍 현재 조건 진단하기", type="primary", use_container_width=True):
             all_v = st.session_state['global_process_vars']
             input_vals = [float(st.session_state['current_inputs'].get(v, 0)) for v in all_v]
-            st.session_state['last_res_val'] = calculate_risk(input_vals)
+            st.session_state['last_diag_val'] = calculate_risk(input_vals)
             st.session_state['last_opt_df'] = None
+            st.session_state['last_res_val'] = None
             st.rerun()
 
+        # [최적 공정 도출]
         if c_btn2.button("✨ 최적 공정 도출", use_container_width=True):
             all_v = st.session_state['global_process_vars']
+            # 시작점을 현재 슬라이더 값으로 설정
             x0 = [float(st.session_state['current_inputs'].get(v, 0.0)) for v in all_v]
             bnds = [st.session_state['global_bounds'].get(v, (0, 100)) for v in all_v]
             
-            res = minimize(calculate_risk, x0, method='L-BFGS-B', bounds=bnds)
+            # 최적화 알고리즘 호출 (SLSQP가 제약 조건 하에서 안정적)
+            res = minimize(calculate_risk, x0, method='SLSQP', bounds=bnds, options={'ftol': 1e-6})
             
             if res.success:
                 opt_dict = {v: int(round(val)) for v, val in zip(all_v, res.x)}
                 st.session_state['last_res_val'] = res.fun
                 st.session_state['last_opt_df'] = pd.DataFrame([{v: opt_dict.get(v) for v in st.session_state['ui_display_vars']}])
+                st.session_state['last_diag_val'] = None
                 st.rerun()
 
-        if st.session_state['last_res_val'] is not None:
-            st.markdown("---")
-            val = st.session_state['last_res_val']
-            st.subheader(f"📊 최종 진단 위험도: {val * 100:.2f}%")
+        # 📊 결과 출력 구역
+        # 1. 현재 진단 결과 출력
+        if st.session_state['last_diag_val'] is not None:
+            val = st.session_state['last_diag_val']
+            st.subheader(f"🔍 현재 조건 위험도: {val * 100:.2f}%")
             st.progress(min(1.0, float(val)))
+            if val > 0.5:
+                st.warning("⚠️ 현재 조건에서 결함 발생 가능성이 높습니다. 최적화를 권장합니다.")
+            else:
+                st.success("✅ 현재 조건이 비교적 안전합니다.")
+
+        # 2. 최적화 결과 출력
+        if st.session_state['last_res_val'] is not None:
+            opt_val = st.session_state['last_res_val']
+            st.subheader(f"✨ 최적 조건 기대 위험도: {opt_val * 100:.2f}%")
+            st.progress(min(1.0, float(opt_val)))
             
             if st.session_state['last_opt_df'] is not None:
-                st.success("✨ AI 추천 최적 공정 조건 (기준값 대비 0~200% 범위 내 최적화)")
                 st.table(st.session_state['last_opt_df'])
-                
                 if st.button("📥 최적 조건을 슬라이더에 즉시 적용"):
                     opt_row = st.session_state['last_opt_df'].iloc[0].to_dict()
                     for v, val in opt_row.items():
